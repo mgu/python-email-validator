@@ -1,14 +1,25 @@
+import sys
+
 from .exceptions_types import *
 
 import dns.resolver
+import dns.asyncresolver
 import dns.exception
 
 
-def validate_email_deliverability(domain, domain_i18n, timeout=None, dns_resolver=None):
+def validate_email_deliverability(email, timeout=None, dns_resolver=None, _async=False):
     # Check that the domain resolves to an MX record. If there is no MX record,
     # try an A or AAAA record which is a deprecated fallback for deliverability.
-    # Raises an EmailUndeliverableError on failure. On success, returns a dict
-    # with deliverability information.
+    # Raises an EmailUndeliverableError on failure. On success, adds additional
+    # validation information to the ValidatedEmail object in the 'email' argument.
+    # When _async is False, returns nothing. When _async is True, returns a Future.
+
+    # In tests, 'email' is passed as a string holding a domain name.
+    if isinstance(email, str):
+        domain_name = email
+        email = ValidatedEmail()
+        email.ascii_domain = domain_name
+        email.domain = domain_name
 
     # If no dns.resolver.Resolver was given, get dnspython's default resolver.
     # Override the default resolver's timeout. This may affect other uses of
@@ -17,103 +28,154 @@ def validate_email_deliverability(domain, domain_i18n, timeout=None, dns_resolve
         from . import DEFAULT_TIMEOUT
         if timeout is None:
             timeout = DEFAULT_TIMEOUT 
-        dns_resolver = dns.resolver.get_default_resolver()
+        if not _async:
+            dns_resolver = dns.resolver.get_default_resolver()
+        else:
+            dns_resolver = dns.asyncresolver.get_default_resolver()
         dns_resolver.lifetime = timeout
 
-    deliverability_info = {}
+    if _async:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
 
-    def dns_resolver_resolve_shim(domain, record):
-        try:
-            # dns.resolver.Resolver.resolve is new to dnspython 2.x.
-            # https://dnspython.readthedocs.io/en/latest/resolver-class.html#dns.resolver.Resolver.resolve
-            return dns_resolver.resolve(domain, record)
-        except AttributeError:
-            # dnspython 2.x is only available in Python 3.6 and later. For earlier versions
-            # of Python, we maintain compatibility with dnspython 1.x which has a
-            # dnspython.resolver.Resolver.query method instead. The only difference is that
-            # query may treat the domain as relative and use the system's search domains,
-            # which we prevent by adding a "." to the domain name to make it absolute.
-            # dns.resolver.Resolver.query is deprecated in dnspython version 2.x.
-            # https://dnspython.readthedocs.io/en/latest/resolver-class.html#dns.resolver.Resolver.query
-            return dns_resolver.query(domain + ".", record)
-
-    try:
-        # We need a way to check how timeouts are handled in the tests. So we
-        # have a secret variable that if set makes this method always test the
-        # handling of a timeout.
-        if getattr(validate_email_deliverability, 'TEST_CHECK_TIMEOUT', False):
-            raise dns.exception.Timeout()
-
-        try:
-            # Try resolving for MX records.
-            response = dns_resolver_resolve_shim(domain, "MX")
-
-            # For reporting, put them in priority order and remove the trailing dot in the qnames.
-            mtas = sorted([(r.preference, str(r.exchange).rstrip('.')) for r in response])
-
-            # Remove "null MX" records from the list (their value is (0, ".") but we've stripped
-            # trailing dots, so the 'exchange' is just ""). If there was only a null MX record,
-            # email is not deliverable.
-            mtas = [(preference, exchange) for preference, exchange in mtas
-                    if exchange != ""]
-            if len(mtas) == 0:
-                raise EmailUndeliverableError("The domain name %s does not accept email." % domain_i18n)
-
-            deliverability_info["mx"] = mtas
-            deliverability_info["mx_fallback_type"] = None
-
-        except (dns.resolver.NoNameservers, dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
-
-            # If there was no MX record, fall back to an A record.
+    def dns_query(domain, record, callback):
+        # When run synchronously or with a synchronous dns.resolver instance,
+        # the query is executed and the callback function is called immediately
+        # with the result or an exception instance.
+        if not _async or not isinstance(dns_resolver, dns.asyncresolver.Resolver):
+            if isinstance(dns_resolver, dns.asyncresolver.Resolver):
+                callback(exception=Exception("Asynchronous dns_resolver cannot be used when called synchronously."))            
             try:
-                response = dns_resolver_resolve_shim(domain, "A")
-                deliverability_info["mx"] = [(0, str(r)) for r in response]
-                deliverability_info["mx_fallback_type"] = "A"
-            except (dns.resolver.NoNameservers, dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+                # We need a way to check how timeouts are handled in the tests. So we
+                # have a secret variable that if set makes this method always test the
+                # handling of a timeout.
+                if getattr(validate_email_deliverability, 'TEST_CHECK_TIMEOUT', False):
+                    raise dns.exception.Timeout()
 
-                # If there was no A record, fall back to an AAAA record.
+                if sys.version_info < (3,):
+                    # dnspython 2.x is only available in Python 3.6 and later. For earlier versions
+                    # of Python, we maintain compatibility with dnspython 1.x which has a
+                    # dnspython.resolver.Resolver.query method instead. The only difference is that
+                    # query may treat the domain as relative and use the system's search domains,
+                    # which we prevent by adding a "." to the domain name to make it absolute.
+                    # dns.resolver.Resolver.query is deprecated in dnspython version 2.x.
+                    # https://dnspython.readthedocs.io/en/latest/resolver-class.html#dns.resolver.Resolver.query
+                    callback(response=dns_resolver.query(domain + ".", record))
+                else:
+                    # dns.resolver.Resolver.resolve is new to dnspython 2.x.
+                    # https://dnspython.readthedocs.io/en/latest/resolver-class.html#dns.resolver.Resolver.resolve
+                    callback(response=dns_resolver.resolve(domain, record))
+            except (dns.resolver.NoNameservers, dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.exception.Timeout) as e:
+                callback(exception=e)
+
+        # When run asynchronously, a task is executed asynchronsouly that executes the DNS
+        # query and passes the result or exception to the callback. The callback must eventually
+        # call the done() function which finishes the Future for the call to validate_email_deliverability.
+        else:
+            async def do_query():
                 try:
-                    response = dns_resolver_resolve_shim(domain, "AAAA")
-                    deliverability_info["mx"] = [(0, str(r)) for r in response]
-                    deliverability_info["mx_fallback_type"] = "AAAA"
-                except (dns.resolver.NoNameservers, dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+                    callback(response = await dns_resolver.resolve(domain, record))
+                except (dns.resolver.NoNameservers, dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.exception.Timeout) as e:
+                    callback(exception = e)
+            import asyncio
+            asyncio.create_task(do_query())
 
-                    # If there was no MX, A, or AAAA record, then mail to
-                    # this domain is not deliverable.
-                    raise EmailUndeliverableError("The domain name %s does not exist." % domain_i18n)
+    def done(exception=None):
+        # Timeouts are a local problem, probably, so we don't reject
+        # email addresses in that case.
+        if exception is dns.exception.Timeout:
+            if not _async:
+                return
+            else:
+                fut.set_result(email)
 
-        try:
+        if not _async:
+            if exception:
+                raise exception
+        else:
+            if exception:
+                fut.set_exception(exception)
+            else:
+                # The future returns the validated email object.
+                fut.set_result(email)
+
+    def got_spf_result(response=None, exception=None):
+        if response:
             # Check for a SPF reject all ("v=spf1 -all") record which indicates
             # no emails are sent from this domain, which like a NULL MX record
             # would indicate that the domain is not used for email.
-            response = dns_resolver_resolve_shim(domain, "TXT")
+            # Ignore exceptions.
             for rec in response:
                 value = b"".join(rec.strings)
                 if value.startswith(b"v=spf1 "):
-                    deliverability_info["spf"] = value.decode("ascii", errors='replace')
+                    email.spf = value.decode("ascii", errors='replace')
                     if value == b"v=spf1 -all":
-                        raise EmailUndeliverableError("The domain name %s does not send email." % domain_i18n)
-        except dns.resolver.NoAnswer:
-            # No TXT records means there is no SPF policy, so we cannot take any action.
-            pass
-        except (dns.resolver.NoNameservers, dns.resolver.NXDOMAIN):
-            # Failure to resolve at this step will be ignored.
-            pass
+                        done(exception=EmailUndeliverableError("The domain name %s does not send email." % email.domain))
+                        return
+        done()
+    
+    def check_spf_record():
+        dns_query(email.ascii_domain, "TXT", callback=got_spf_result)
 
-    except dns.exception.Timeout:
-        # A timeout could occur for various reasons, so don't treat it as a failure.
-        return {
-            "unknown-deliverability": "timeout",
-        }
+    def got_aaaa_record(response=None, exception=None):
+        if exception:
+            # If there was no MX, A, or AAAA record, then mail to
+            # this domain is not deliverable.
+            return done(exception=EmailUndeliverableError("The domain name %s does not exist." % email.domain))
 
-    except EmailUndeliverableError:
-        # Don't let these get clobbered by the wider except block below.
-        raise
+        # We got an AAAA record.
+        email.mx = [(0, str(r)) for r in response]
+        email.mx_fallback_type = "AAAA"
 
-    except Exception as e:
-        # Unhandled conditions should not propagate.
-        raise EmailUndeliverableError(
-            "There was an error while checking if the domain name in the email address is deliverable: " + str(e)
-        )
+        # Now check SPF.
+        check_spf_record()
 
-    return deliverability_info
+    def got_a_record(response=None, exception=None):
+        if exception:
+            # If there was no MX or A record, fall back to an AAAA record.
+            dns_query(email.ascii_domain, "AAAA", callback=got_aaaa_record)
+            return
+
+        # We got an A record.
+        email.mx = [(0, str(r)) for r in response]
+        email.mx_fallback_type = "A"
+
+        # Now check SPF.
+        check_spf_record()
+
+    def got_mx_record(response=None, exception=None):
+        if exception:
+            # If there was no MX record, fall back to an A record.
+            dns_query(email.ascii_domain, "A", callback=got_a_record)
+            return
+
+        # We got one or more MX records.
+
+        # For reporting, put them in priority order and remove the trailing dot in the qnames.
+        mtas = sorted([(r.preference, str(r.exchange).rstrip('.')) for r in response])
+
+        # Remove "null MX" records from the list (their value is (0, ".") but we've stripped
+        # trailing dots, so the 'exchange' is just ""). If there was only a null MX record,
+        # email is not deliverable.
+        mtas = [(preference, exchange) for preference, exchange in mtas
+                if exchange != ""]
+        if len(mtas) == 0:
+            done(exception=EmailUndeliverableError("The domain name %s does not accept email." % email.domain))
+            return
+
+        email.mx = mtas
+        email.mx_fallback_type = None
+
+        # Now check SPF.
+        check_spf_record()
+
+    dns_query(email.ascii_domain, "MX", callback=got_mx_record)
+
+    if not _async:
+        # In tests, we check the returned object. But it is not used
+        # by the main library.
+        return email
+    else:
+        # Return the Future when calling asynchronously.
+        return fut

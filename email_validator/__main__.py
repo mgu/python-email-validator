@@ -27,24 +27,38 @@ def __utf8_output_shim(output_str):
     return output_str
 
 
-def main():
-    if len(sys.argv) == 1:
-        # Validate the email addresses pased line-by-line on STDIN.
-        dns_resolver = caching_resolver()
-        for line in sys.stdin:
-            email = __utf8_input_shim(line.strip())
-            try:
-                validate_email(email, dns_resolver=dns_resolver)
-            except EmailNotValidError as e:
-                print(__utf8_output_shim("{} {}".format(email, e)))
-    else:
-        # Validate the email address passed on the command line.
-        email = __utf8_input_shim(sys.argv[1])
+def main_sync(email):
+    try:
+        result = validate_email(email)
+        print(json.dumps(result.as_dict(), indent=2, sort_keys=True, ensure_ascii=False))
+    except EmailNotValidError as e:
+        print(__utf8_output_shim(e))
+
+
+async def main_async(source_iterator):
+    # Validate the email addresses pased line-by-line on STDIN asynchronously.
+    dns_resolver = caching_resolver(_async=True)
+    for line in source_iterator:
+        email = __utf8_input_shim(line.strip())
         try:
-            result = validate_email(email)
-            print(json.dumps(result.as_dict(), indent=2, sort_keys=True, ensure_ascii=False))
+            print(await validate_email(email, dns_resolver=dns_resolver, _async=True))
         except EmailNotValidError as e:
-            print(__utf8_output_shim(e))
+            print(__utf8_output_shim("{} {}".format(email, e)))
+
+
+def main():
+    if len(sys.argv) > 1:
+        # Validate the single email address passed on the command line and
+        # print the validation result details as JSON or the validation
+        # error message.
+        email = __utf8_input_shim(sys.argv[1])
+        main_sync(email)
+        return
+
+    else:
+        # Run the asynchronous tool.
+        import asyncio
+        asyncio.run(main_async(sys.stdin))
 
 
 if __name__ == "__main__":

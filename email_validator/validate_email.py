@@ -11,11 +11,14 @@ else:
     unicode_class = unicode  # noqa: F821
 
 
-def caching_resolver(*, timeout=None, cache=None):
+def caching_resolver(*, timeout=None, cache=None, _async=False):
     if timeout is None:
         from . import DEFAULT_TIMEOUT
         timeout = DEFAULT_TIMEOUT
-    resolver = dns.resolver.Resolver()
+    if not _async:
+        resolver = dns.resolver.get_default_resolver()
+    else:
+        resolver = dns.asyncresolver.get_default_resolver()
     resolver.cache = cache or dns.resolver.LRUCache()
     resolver.lifetime = timeout  # timeout, in seconds
     return resolver
@@ -31,7 +34,8 @@ def validate_email(
     test_environment=None,
     globally_deliverable=None,
     timeout=None,
-    dns_resolver=None
+    dns_resolver=None,
+    _async=False
 ):
     """
     Validates an email address, raising an EmailNotValidError if the address is not valid or returning a dict of
@@ -60,6 +64,11 @@ def validate_email(
             email = email.decode("ascii")
         except ValueError:
             raise EmailSyntaxError("The email address is not valid ASCII.")
+
+    # Perform syntax validation
+    ###########################
+
+    # When run asynchronously, this part actually executes synchronously.
 
     # At-sign.
     parts = email.split('@')
@@ -131,13 +140,25 @@ def validate_email(
 
     if check_deliverability and not test_environment:
         # Validate the email address's deliverability using DNS
-        # and update the return dict with metadata.
-        deliverability_info = validate_email_deliverability(
-            ret["domain"], ret["domain_i18n"], timeout, dns_resolver
-        )
-        for key, value in deliverability_info.items():
-            setattr(ret, key, value)
+        # and update the returned validation information object.
+        fut = validate_email_deliverability(ret, timeout, dns_resolver, _async=_async)
 
-    return ret
+        # When running asynchronously, a Future is returned, which we
+        # can pass to the caller. When running synchonously, nothing
+        # is returned.
+        if _async:
+            return fut
 
+    if not _async:
+        # Return the validation information directly.
+        return ret
 
+    else:
+        # Return a Future that is already complete and
+        # holds the validation information object as its
+        # result.
+        import asyncio
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        fut.set_result(ret)
+        return fut

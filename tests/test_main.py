@@ -528,8 +528,7 @@ def test_dict_accessor():
 
 
 def test_deliverability_found():
-    response = validate_email_deliverability('gmail.com', 'gmail.com')
-    assert response.keys() == {'mx', 'mx_fallback_type', 'spf'}
+    response = validate_email_deliverability('gmail.com')
     assert response['mx_fallback_type'] is None
     assert len(response['mx']) > 1
     assert len(response['mx'][0]) == 2
@@ -541,17 +540,17 @@ def test_deliverability_fails():
     # No MX record.
     domain = 'xkxufoekjvjfjeodlfmdfjcu.com'
     with pytest.raises(EmailUndeliverableError, match='The domain name {} does not exist'.format(domain)):
-        validate_email_deliverability(domain, domain)
+        validate_email_deliverability(domain)
 
     # Null MX record.
     domain = 'example.com'
     with pytest.raises(EmailUndeliverableError, match='The domain name {} does not accept email'.format(domain)):
-        validate_email_deliverability(domain, domain)
+        validate_email_deliverability(domain)
 
 
 def test_deliverability_dns_timeout():
     validate_email_deliverability.TEST_CHECK_TIMEOUT = True
-    response = validate_email_deliverability('gmail.com', 'gmail.com')
+    response = validate_email_deliverability('gmail.com')
     assert "mx" not in response
     assert response.get("unknown-deliverability") == "timeout"
     validate_email('test@gmail.com')
