@@ -3,8 +3,6 @@
 import sys
 import re
 import unicodedata
-import dns.resolver
-import dns.exception
 import idna  # implements IDNA 2008; Python's codec is only IDNA 2003
 
 # Default values for keyword arguments.
@@ -253,6 +251,8 @@ def __get_length_reason(addr, utf8=False, limit=EMAIL_MAX_LENGTH):
 
 
 def caching_resolver(*, timeout=None, cache=None):
+    import dns.resolver  # slow loading import
+
     if timeout is None:
         timeout = DEFAULT_TIMEOUT
     resolver = dns.resolver.Resolver()
@@ -596,6 +596,7 @@ def validate_email_deliverability(domain, domain_i18n, timeout=DEFAULT_TIMEOUT, 
     # try an A or AAAA record which is a deprecated fallback for deliverability.
     # (Note that changing the DEFAULT_TIMEOUT module-level attribute
     #  will not change the default value of this method's timeout argument.)
+    import dns.resolver  # slow loading import
 
     # If no dns.resolver.Resolver was given, get dnspython's default resolver.
     # Override the default resolver's timeout. This may affect other uses of
